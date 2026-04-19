@@ -212,7 +212,12 @@ def load_expiry_df(csv_path):
     try:
         # csv_path is hf://...
         df = pd.read_csv(csv_path, storage_options={"token": HF_TOKEN})
-        df["adjusted_expiry"] = pd.to_datetime(df["adjusted_expiry"], errors="coerce")
+        # Map actual_expiry to adjusted_expiry if necessary
+        if "actual_expiry" in df.columns and "adjusted_expiry" not in df.columns:
+            df = df.rename(columns={"actual_expiry": "adjusted_expiry"})
+        
+        # Handle DD/MM/YY format from project CSV
+        df["adjusted_expiry"] = pd.to_datetime(df["adjusted_expiry"], dayfirst=True, errors="coerce")
         df = df.dropna(subset=["adjusted_expiry"]).copy()
         df["exp_date"] = df["adjusted_expiry"].dt.date
         return df.sort_values("adjusted_expiry").reset_index(drop=True)
