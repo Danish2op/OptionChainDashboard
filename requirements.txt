@@ -1,0 +1,8 @@
+streamlit
+pandas
+duckdb
+huggingface_hub
+pyarrow
+fsspec
+plotly
+numpy
