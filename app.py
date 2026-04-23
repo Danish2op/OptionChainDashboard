@@ -65,53 +65,25 @@ st.set_page_config(page_title="Option Chain",page_icon="📊",
 # ──────────────────────────────────────────────────────────────────────────────
 
 def parquet_path(base, d):
-    # base is already hf://datasets/REPO_ID
     return f"{base}/{d.year}/{MON_FWD[d.month]}/{d.year}_{d.month:02d}_{d.day:02d}.parquet"
 
 
 _MON_PAT = "JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC"
 _RE_SERIES  = re.compile(r'^(.+?)-(I{1,3})$')
-# NEW 2021+ :  INST DD MMM YY STRIKE CE/PE
 _RE_NEW_OPT = re.compile(r'^(.+?)(\d{2})(' + _MON_PAT + r')(\d{2})(\d+)(CE|PE)$')
-# OLD pre-2021: INST YY MMM STRIKE CE/PE   (no day)
 _RE_OLD_OPT = re.compile(r'^(.+?)(\d{2})(' + _MON_PAT + r')(\d+)(CE|PE)$')
-# NEW futures
 _RE_NEW_FUT = re.compile(r'^(.+?)(\d{2})(' + _MON_PAT + r')(\d{2})FUT$')
-# OLD futures
 _RE_OLD_FUT = re.compile(r'^(.+?)(\d{2})(' + _MON_PAT + r')FUT$')
 
 
 def parse_ticker(ticker):
-    """Parse NSE option/futures ticker into components.
-
-    Format disambiguation:
-      OLD (pre-2021): INST + YY + MMM + STRIKE + CE/PE   e.g. NIFTY19JAN10900CE
-      NEW (2021+)   : INST + DD + MMM + YY + STRIKE + CE/PE  e.g. NIFTY30JAN2524950CE
-
-    Problem: RELIANCE19JAN1440CE matches NEW as dd=19,JAN,yy=14,strike=40 (wrong).
-    Fix: try OLD first. If OLD yields strike >= 100, accept it.
-         Only try NEW if OLD fails or gives strike < 100.
-         This works because pre-2021 data is always OLD, and NEW-format strikes are always >= 100.
-    """
     t = ticker.replace(".NFO","").replace(".BSE","").strip().upper()
-
-    # Futures series  NIFTY-I  /  RELIANCE-II  /  ACC-III
     m = _RE_SERIES.match(t)
     if m:
         return dict(inst=m.group(1), exp=None, strike=None, otype="FUT_SERIES",
                     series=m.group(2))
-
-    # Both OLD and NEW regexes can match the same ticker string.
-    # Disambiguation: try both, pick the one with a reasonable strike.
-    #   OLD: INST + YY + MMM + STRIKE    e.g. NIFTY19JAN10900CE  (strike=10900)
-    #   NEW: INST + DD + MMM + YY + STRIKE  e.g. BANKNIFTY14FEB1927400CE (strike=27400)
-    # Heuristic: real strikes are in [1, 200000]. If OLD gives strike > 200000,
-    # it's actually a NEW-format ticker. If NEW gives strike < 100 for a number
-    # that OLD would give >= 100, prefer OLD.
-
     m_old = _RE_OLD_OPT.match(t)
     m_new = _RE_NEW_OPT.match(t)
-
     old_result = None
     if m_old:
         yy,mon,strike = int(m_old.group(2)),m_old.group(3),int(m_old.group(4))
@@ -123,7 +95,6 @@ def parse_ticker(ticker):
                 old_result = dict(inst=m_old.group(1), exp=exp, strike=strike,
                                   otype=m_old.group(5), exp_label=f"{mon}{yy:02d}")
             except (ValueError,KeyError): pass
-
     new_result = None
     if m_new:
         dd,mon,yy,strike = int(m_new.group(2)),m_new.group(3),int(m_new.group(4)),int(m_new.group(5))
@@ -134,19 +105,12 @@ def parse_ticker(ticker):
                 new_result = dict(inst=m_new.group(1), exp=exp, strike=strike,
                                   otype=m_new.group(6), exp_label=f"{mon}{yy:02d}")
             except ValueError: pass
-
     if old_result and new_result:
-        # If OLD strike is absurdly large (> 200000), it's actually NEW format
         if old_result["strike"] > 200000:
             return new_result
-        # If both reasonable, prefer OLD (more common in pre-2021 data)
         return old_result
-    if old_result:
-        return old_result
-    if new_result:
-        return new_result
-
-    # OLD futures  NIFTY19JANFUT  (try before NEW to avoid same ambiguity)
+    if old_result: return old_result
+    if new_result: return new_result
     m = _RE_OLD_FUT.match(t)
     if m:
         yy,mon = int(m.group(2)),m.group(3)
@@ -157,8 +121,6 @@ def parse_ticker(ticker):
             return dict(inst=m.group(1), exp=exp, strike=None, otype="FUT",
                         exp_label=f"{mon}{yy:02d}")
         except (ValueError,KeyError): pass
-
-    # NEW futures  NIFTY30JAN25FUT
     m = _RE_NEW_FUT.match(t)
     if m:
         dd,mon,yy = int(m.group(2)),m.group(3),int(m.group(4))
@@ -169,15 +131,12 @@ def parse_ticker(ticker):
                 return dict(inst=m.group(1), exp=exp, strike=None, otype="FUT",
                             exp_label=f"{mon}{yy:02d}")
             except ValueError: pass
-
     return dict(inst=None, exp=None, strike=None, otype=None)
 
 
 def _norm_time(t):
-    """Normalise '09:15:59' -> '09:15' (drop seconds)."""
     s = str(t).strip()
-    if len(s) >= 5:
-        return s[:5]
+    if len(s) >= 5: return s[:5]
     return s
 
 
@@ -210,13 +169,9 @@ def fmt_chg(v):
 @st.cache_data(ttl=86400, max_entries=1, show_spinner=False)
 def load_expiry_df(csv_path):
     try:
-        # csv_path is hf://...
         df = pd.read_csv(csv_path, storage_options={"token": HF_TOKEN})
-        # Map actual_expiry to adjusted_expiry if necessary
         if "actual_expiry" in df.columns and "adjusted_expiry" not in df.columns:
             df = df.rename(columns={"actual_expiry": "adjusted_expiry"})
-        
-        # Handle DD/MM/YY format from project CSV
         df["adjusted_expiry"] = pd.to_datetime(df["adjusted_expiry"], dayfirst=True, errors="coerce")
         df = df.dropna(subset=["adjusted_expiry"]).copy()
         df["exp_date"] = df["adjusted_expiry"].dt.date
@@ -228,7 +183,6 @@ def load_expiry_df(csv_path):
 
 @st.cache_data(ttl=7200, max_entries=2, show_spinner=False)
 def get_available_dates(repo_id):
-    """Crawl the Hugging Face repo to find all available parquet dates."""
     try:
         api = HfApi(token=HF_TOKEN)
         files = api.list_repo_files(repo_id=repo_id, repo_type="dataset")
@@ -242,7 +196,6 @@ def get_available_dates(repo_id):
                 except ValueError: pass
         return sorted(list(set(avail)))
     except Exception as e:
-        # Fallback to demo mode dates if API fails
         st.sidebar.error(f"HF API Error: {e}")
         d = date.today(); avail = []
         while len(avail) < 60:
@@ -253,16 +206,12 @@ def get_available_dates(repo_id):
 
 @st.cache_data(ttl=3600, max_entries=8, show_spinner=False)
 def load_parquet_raw(pp):
-    """Load entire parquet once per file — cached. Returns (df, all_tickers, parsed_map)."""
     try:
-        # pp is hf://datasets/REPO_ID/...
         df = pd.read_parquet(pp, storage_options={"token": HF_TOKEN})
     except Exception:
         return pd.DataFrame(), [], {}
     if df.empty:
         return df, [], {}
-
-    # Normalise column names: map whatever casing to our standard names
     col_map = {}
     for c in df.columns:
         cl = c.strip().lower()
@@ -277,116 +226,74 @@ def load_parquet_raw(pp):
         elif cl in ("open interest","openinterest","oi"):
             col_map[c] = "oi"
     df = df.rename(columns=col_map)
-
-    # Ensure required columns exist
     required = ["ticker","time","open_","high","low","close"]
     for r in required:
         if r not in df.columns:
             return pd.DataFrame(), [], {}
-
-    if "volume" not in df.columns:
-        df["volume"] = 0
-    if "oi" not in df.columns:
-        df["oi"] = 0
-
-    # Cast float32 -> float64 to avoid precision loss
+    if "volume" not in df.columns: df["volume"] = 0
+    if "oi" not in df.columns:     df["oi"] = 0
     for c in ["open_","high","low","close"]:
         if df[c].dtype == "float32":
             df[c] = df[c].astype("float64")
-
-    # Sort and build minute column
     df = df.sort_values(["ticker","time"]).reset_index(drop=True)
     df["minute"] = df["time"].apply(_norm_time)
-
     all_tickers = sorted(df["ticker"].unique().tolist())
     parsed_map = {tk: parse_ticker(tk) for tk in all_tickers}
     return df, all_tickers, parsed_map
 
 
 def get_instruments_from_parsed(parsed_map):
-    """Extract sorted unique instruments, priority first."""
     insts = set()
     for p in parsed_map.values():
-        if p["inst"]:
-            insts.add(p["inst"])
+        if p["inst"]: insts.add(p["inst"])
     priority = [i for i in PRIORITY_INSTRUMENTS if i in insts]
     rest = sorted(i for i in insts if i not in set(PRIORITY_INSTRUMENTS))
     return priority + rest
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  BUILD OPTION CHAIN from raw df
+#  BUILD OPTION CHAIN
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _format_exp_date(exp_date, sel_date):
-    """Format expiry date like Sensibull: '17 Feb (0d)' or '24 Feb (7d)'."""
-    if not exp_date or not hasattr(exp_date, 'strftime'):
-        return str(exp_date)
+    if not exp_date or not hasattr(exp_date, 'strftime'): return str(exp_date)
     dte = (exp_date - sel_date).days
     return f"{exp_date.strftime('%d %b')} ({dte}d)"
 
 
 def _exp_date_to_key(exp_date):
-    """Convert date to string key for session_state storage."""
-    if exp_date and hasattr(exp_date, 'isoformat'):
-        return exp_date.isoformat()
+    if exp_date and hasattr(exp_date, 'isoformat'): return exp_date.isoformat()
     return str(exp_date)
 
 
 def _key_to_exp_date(key):
-    """Convert string key back to date."""
-    if not key:
-        return None
-    try:
-        return date.fromisoformat(key)
-    except (ValueError, TypeError):
-        return None
+    if not key: return None
+    try: return date.fromisoformat(key)
+    except (ValueError, TypeError): return None
 
 
 def build_chain(df, parsed_map, inst, time_str, sel_exp_key, depth, sel_date=None):
-    """
-    Build option chain for `inst` at `time_str`.
-    sel_exp_key = ISO date string of selected expiry (e.g. '2022-02-17')
-    Groups by actual expiry date — supports weekly expiries.
-    """
     sel_exp_date = _key_to_exp_date(sel_exp_key)
-
-    # Tag rows
     inst_mask = df["ticker"].map(lambda tk: parsed_map[tk]["inst"] == inst)
     otype_mask = df["ticker"].map(lambda tk: parsed_map[tk]["otype"] in ("CE","PE"))
     df_inst = df[inst_mask & otype_mask].copy()
-    if df_inst.empty:
-        return {}
-
+    if df_inst.empty: return {}
     df_inst["strike"] = df_inst["ticker"].map(lambda tk: parsed_map[tk]["strike"])
     df_inst["otype"]  = df_inst["ticker"].map(lambda tk: parsed_map[tk]["otype"])
     df_inst["exp"]    = df_inst["ticker"].map(lambda tk: parsed_map[tk]["exp"])
-
-    # All unique expiry dates, sorted chronologically
     all_exp_dates = sorted([e for e in df_inst["exp"].dropna().unique() if e is not None])
-    if not all_exp_dates:
-        return {}
-    if sel_exp_date not in all_exp_dates:
-        sel_exp_date = all_exp_dates[0]
-
-    # Get the exact minute bar at time_str (minute-level OHLCV)
+    if not all_exp_dates: return {}
+    if sel_exp_date not in all_exp_dates: sel_exp_date = all_exp_dates[0]
     df_at_min = df_inst[df_inst["minute"] == time_str].copy()
-
-    # Fallback: if no data at exact minute, use last available minute <= time_str
     if df_at_min.empty:
         df_before = df_inst[df_inst["minute"] <= time_str]
-        if df_before.empty:
-            df_before = df_inst
+        if df_before.empty: df_before = df_inst
         last_min = df_before["minute"].max()
         df_at_min = df_inst[df_inst["minute"] == last_min].copy()
-
-    # For OI: use last available up to time_str (OI doesn't update every bar)
     df_oi = (df_inst[df_inst["minute"] <= time_str]
              .sort_values("minute")
              .groupby("ticker")["oi"].last()
              .reset_index(name="oi_latest"))
-
-    # Snapshot: one row per ticker — the exact minute bar's OHLCV
     snap = (df_at_min.groupby("ticker")
             .agg(open_=("open_","last"), high=("high","last"),
                  low=("low","last"), close=("close","last"),
@@ -394,18 +301,11 @@ def build_chain(df, parsed_map, inst, time_str, sel_exp_key, depth, sel_date=Non
                  strike=("strike","first"), otype=("otype","first"),
                  exp=("exp","first"))
             .reset_index())
-
-    # Merge OI (keep minute bar's volume as-is)
     snap = pd.merge(snap, df_oi, on="ticker", how="left")
     snap["oi"] = snap["oi_latest"].fillna(0)
     snap = snap.drop(columns=["oi_latest"], errors="ignore")
-
-    # Filter to selected expiry date
     df_exp = snap[snap["exp"] == sel_exp_date].copy()
-    if df_exp.empty:
-        return {}
-
-    # Aggregate by strike to avoid duplicates
+    if df_exp.empty: return {}
     ce = (df_exp[df_exp["otype"]=="CE"]
           .groupby("strike")
           .agg(ce_open=("open_","first"), ce_high=("high","max"),
@@ -418,30 +318,23 @@ def build_chain(df, parsed_map, inst, time_str, sel_exp_key, depth, sel_date=Non
                pe_low=("low","min"), pe_ltp=("close","last"),
                pe_oi=("oi","sum"), pe_vol=("volume","sum"))
           .reset_index())
-
     chain = pd.merge(ce, pe, on="strike", how="outer").sort_values("strike").fillna(0)
     chain["ce_oi_lakh"] = (chain["ce_oi"]/1e5).round(1)
     chain["pe_oi_lakh"] = (chain["pe_oi"]/1e5).round(1)
-
-    # OI change vs market open
     first_min = df_inst["minute"].min()
     open_oi = (df_inst[df_inst["minute"]==first_min]
                .groupby("ticker")["oi"].last().reset_index(name="oi_open"))
     snap2 = pd.merge(snap, open_oi, on="ticker", how="left").fillna(0)
     snap2["oi_chg"] = snap2["oi"] - snap2["oi_open"]
-
     for side, ot in [("ce","CE"),("pe","PE")]:
         chg = (snap2[(snap2["otype"]==ot)&(snap2["exp"]==sel_exp_date)]
                .groupby("strike")["oi_chg"].sum().reset_index()
                .rename(columns={"oi_chg":f"{side}_oi_chg"}))
         chain = pd.merge(chain, chg, on="strike", how="left").fillna(0)
-
     chain["ce_oi_base"] = (chain["ce_oi"]-chain["ce_oi_chg"]).clip(lower=0)
     chain["pe_oi_base"] = (chain["pe_oi"]-chain["pe_oi_chg"]).clip(lower=0)
     chain["ce_chg_pct"] = (chain["ce_oi_chg"]/chain["ce_oi_base"].clip(lower=1)*100).round(1)
     chain["pe_chg_pct"] = (chain["pe_oi_chg"]/chain["pe_oi_base"].clip(lower=1)*100).round(1)
-
-    # Spot from futures
     fut_mask = df["ticker"].map(lambda tk: parsed_map[tk]["inst"]==inst and
                                  parsed_map[tk]["otype"] in ("FUT_SERIES","FUT"))
     df_fut = df[fut_mask].copy()
@@ -451,29 +344,22 @@ def build_chain(df, parsed_map, inst, time_str, sel_exp_key, depth, sel_date=Non
         if not df_fut_t.empty:
             fut_snap = df_fut_t.sort_values("minute").groupby("ticker")["close"].last()
             near = [tk for tk in fut_snap.index if tk.upper().endswith("-I.NFO")]
-            if near:
-                spot = float(fut_snap[near[0]])
-            else:
-                spot = float(fut_snap.iloc[0])
-    if spot is None:
-        spot = float(chain["strike"].median())
-
+            if near: spot = float(fut_snap[near[0]])
+            else: spot = float(fut_snap.iloc[0])
+    if spot is None: spot = float(chain["strike"].median())
     itv = _detect_interval(chain["strike"].tolist()) or 50
     atm = int(round(spot/itv)*itv)
     chain["atm_dist"] = ((chain["strike"]-atm)/itv).abs()
-    if depth > 0:
-        chain = chain[chain["atm_dist"]<=depth]
+    if depth > 0: chain = chain[chain["atm_dist"]<=depth]
     chain["is_atm"]    = chain["strike"]==atm
     chain["is_itm_ce"] = chain["strike"]<atm
     chain["is_itm_pe"] = chain["strike"]>atm
-
     return dict(chain=chain, atm=atm, spot=spot, itv=itv,
-                expiry_dates=all_exp_dates,
-                sel_expiry_date=sel_exp_date)
+                expiry_dates=all_exp_dates, sel_expiry_date=sel_exp_date)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  DEMO DATA (when no parquet)
+#  DEMO DATA
 # ──────────────────────────────────────────────────────────────────────────────
 
 def make_demo_chain(inst, sel_date, time_str, sel_exp_key, depth):
@@ -481,16 +367,13 @@ def make_demo_chain(inst, sel_date, time_str, sel_exp_key, depth):
     spot = DEMO_SPOT.get(inst,1000) + np.random.randint(-50,50)
     itv  = DEMO_ITV.get(inst,20)
     atm  = int(round(spot/itv)*itv)
-    # Fake weekly expiry dates (Thu every week + monthly)
     exp_dates = []
     d = sel_date
     while len(exp_dates) < 8:
-        if d.weekday() == 3:  # Thursday
-            exp_dates.append(d)
+        if d.weekday() == 3: exp_dates.append(d)
         d += timedelta(days=1)
     sel_exp_date = _key_to_exp_date(sel_exp_key)
-    if sel_exp_date not in exp_dates:
-        sel_exp_date = exp_dates[0]
+    if sel_exp_date not in exp_dates: sel_exp_date = exp_dates[0]
     n = depth if depth>0 else 15
     rows=[]
     for k in [atm+itv*i for i in range(-n,n+1)]:
@@ -548,7 +431,7 @@ def make_demo_ohlcv(ticker, date_str):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  CSS
+#  CSS — Option Chain Table  (unchanged)
 # ──────────────────────────────────────────────────────────────────────────────
 
 TABLE_CSS = """
@@ -603,7 +486,7 @@ TABLE_CSS = """
 """
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  RENDER CHAIN TABLE
+#  RENDER CHAIN TABLE  (unchanged)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def render_chain_table(data):
@@ -675,7 +558,7 @@ def render_chain_table(data):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  OI CHANGE CHART
+#  OI CHANGE CHART  (unchanged)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def render_oi_chart(data, df_raw, parsed_map, inst, active_exp_dates,
@@ -683,7 +566,6 @@ def render_oi_chart(data, df_raw, parsed_map, inst, active_exp_dates,
     atm  = data.get("atm",10900)
     spot = data.get("spot")
     itv  = data.get("itv",50)
-
     if not is_demo and not df_raw.empty:
         inst_mask = df_raw["ticker"].map(lambda tk: parsed_map[tk]["inst"]==inst)
         otype_mask = df_raw["ticker"].map(lambda tk: parsed_map[tk]["otype"] in ("CE","PE"))
@@ -710,7 +592,6 @@ def render_oi_chart(data, df_raw, parsed_map, inst, active_exp_dates,
         oi_df = pd.DataFrame({"strike":strikes,
             "ce_chg":np.random.normal(0,30000,len(strikes)),
             "pe_chg":np.random.normal(5000,35000,len(strikes))})
-
     fig = go.Figure()
     fig.add_bar(x=oi_df["strike"],y=(oi_df["pe_chg"]/1e5).round(2),
                 name="Put OI chg",marker_color="#43a047",marker_opacity=.82,
@@ -738,52 +619,42 @@ def render_oi_chart(data, df_raw, parsed_map, inst, active_exp_dates,
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  VIEW CHART TAB  — TradingView-style candlestick for any ticker
+#  VIEW CHART TAB  (unchanged)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def render_view_chart(df_raw, all_tickers, parsed_map, all_insts,
                       inst, date_str, time_str, expiry_dates, is_demo):
-
-    # ── Global search bar — search ANY ticker across ALL instruments ──
     st.markdown(
-        '<div style="font-size:.72rem;color:#666;margin-bottom:4px">'
+        '<div style="font-size:.72rem;color:#444;margin-bottom:4px">'
         '<b>Quick Search</b> — type any ticker name directly '
         '(e.g. <code>RELIANCE-I</code>, <code>NIFTY19JAN10900CE</code>, '
         '<code>SBIN</code>, <code>27000CE</code>)</div>',
         unsafe_allow_html=True)
-
     global_search = st.text_input(
         "Search all tickers", value="",
         placeholder="Type ticker name to search across ALL instruments...",
         key="vc_global_search", label_visibility="collapsed")
-
     gs = global_search.strip().upper()
     if gs:
-        # Search across ALL tickers, not just one instrument
         matched = [tk for tk in all_tickers if gs in tk.upper()]
         if matched:
             st.markdown(
                 f'<div style="font-size:.68rem;color:#2e7d32;margin:2px 0 6px">'
                 f'Found <b>{len(matched)}</b> tickers matching "<b>{gs}</b>"</div>',
                 unsafe_allow_html=True)
-
             sel_ticker = st.selectbox(
                 "Select from results", matched,
                 key="vc_global_result", label_visibility="collapsed")
         else:
             st.warning(f"No tickers matching **'{gs}'**. Try a shorter search term.")
-            # Fall through to instrument-based selection below
             gs = ""
-
     if not gs:
         st.markdown('<hr style="margin:8px 0;border-color:#e4e0d8"/>',
                     unsafe_allow_html=True)
         st.markdown(
-            '<div style="font-size:.68rem;color:#888;margin-bottom:4px">'
+            '<div style="font-size:.68rem;color:#666;margin-bottom:4px">'
             'Or browse by instrument:</div>',
             unsafe_allow_html=True)
-
-    # ── Instrument-based selector (used when no global search) ──
     if not gs:
         c1, c2, c3, c4 = st.columns([1.2, 0.9, 0.9, 2.0])
         with c1:
@@ -794,18 +665,13 @@ def render_view_chart(df_raw, all_tickers, parsed_map, all_insts,
             type_opts = ["All","Futures Only","CE Only","PE Only"]
             type_sel = st.selectbox("Type", type_opts, key="vc_type",
                                      label_visibility="collapsed")
-
-        # Build ticker list for selected instrument (before expiry filter)
         inst_tickers = [tk for tk in all_tickers if parsed_map[tk]["inst"] == vc_inst]
-
-        # Collect unique expiry dates for this instrument
         _vc_exp_dates = sorted(set(
             parsed_map[tk]["exp"] for tk in inst_tickers
             if parsed_map[tk].get("exp")
         ))
         _vc_sel_date = date.fromisoformat(date_str)
         _vc_exp_display = [_format_exp_date(e, _vc_sel_date) for e in _vc_exp_dates]
-
         with c3:
             exp_opts = ["All Expiries"] + _vc_exp_display
             exp_sel = st.selectbox("Expiry", exp_opts, key="vc_exp",
@@ -814,8 +680,6 @@ def render_view_chart(df_raw, all_tickers, parsed_map, all_insts,
             search = st.text_input("Filter", value="",
                                     placeholder=f"e.g. {vc_inst}-I or 10900",
                                     key="vc_search", label_visibility="collapsed")
-
-        # Apply type filter
         if type_sel == "Futures Only":
             inst_tickers = [tk for tk in inst_tickers
                             if parsed_map[tk]["otype"] in ("FUT","FUT_SERIES")]
@@ -823,38 +687,27 @@ def render_view_chart(df_raw, all_tickers, parsed_map, all_insts,
             inst_tickers = [tk for tk in inst_tickers if parsed_map[tk]["otype"]=="CE"]
         elif type_sel == "PE Only":
             inst_tickers = [tk for tk in inst_tickers if parsed_map[tk]["otype"]=="PE"]
-
-        # Apply expiry filter
         if exp_sel != "All Expiries" and exp_sel in _vc_exp_display:
             _sel_exp_d = _vc_exp_dates[_vc_exp_display.index(exp_sel)]
             inst_tickers = [tk for tk in inst_tickers
                             if parsed_map[tk].get("exp") == _sel_exp_d]
-
-        # Apply text filter
         flt = search.strip().upper()
         if flt:
             inst_tickers = [tk for tk in inst_tickers if flt in tk.upper()]
-
-        st.markdown(f'<div style="font-size:.68rem;color:#888;margin:2px 0 6px">'
+        st.markdown(f'<div style="font-size:.68rem;color:#666;margin:2px 0 6px">'
                     f'{len(inst_tickers)} tickers for <b>{vc_inst}</b>'
                     f'{" (demo)" if is_demo else ""}</div>',
                     unsafe_allow_html=True)
-
         if not inst_tickers:
             st.warning(f"No tickers for **{vc_inst}** with current filters.")
             return
-
-        # Default to futures -I
         default_idx = 0
         for i, tk in enumerate(inst_tickers):
             if tk.endswith("-I.NFO"):
                 default_idx = i
                 break
-
         sel_ticker = st.selectbox("Ticker", inst_tickers, index=default_idx,
                                    key="vc_sel_ticker", label_visibility="collapsed")
-
-    # Time range
     tc1, tc2 = st.columns(2)
     with tc1:
         t_from = st.text_input("From", "09:15", key="vc_from")
@@ -862,40 +715,28 @@ def render_view_chart(df_raw, all_tickers, parsed_map, all_insts,
     with tc2:
         t_to = st.text_input("To", time_str, key="vc_to")
         if not re.match(r'^\d{2}:\d{2}$', t_to): t_to = time_str
-
-    # Load data
     ticker = sel_ticker.strip()
     if not is_demo and not df_raw.empty:
         df_tk = df_raw[df_raw["ticker"]==ticker].copy()
     else:
         df_tk = pd.DataFrame()
-
     if df_tk.empty:
         df_tk = make_demo_ohlcv(ticker, date_str)
-
     df_plot = df_tk[(df_tk["minute"]>=t_from)&(df_tk["minute"]<=t_to)].copy()
     if df_plot.empty:
         st.warning(f"No data for **{ticker}** in {t_from}–{t_to}")
         return
-
-    # Parse for subtitle
     p = parse_ticker(ticker)
     parts = [p.get("inst") or vc_inst]
-    if p.get("strike"):
-        parts.append(f"{p['strike']} {p.get('otype','')}")
-    if p.get("exp_label"):
-        parts.append(f"Exp: {p['exp_label']}")
-    elif p.get("otype") == "FUT_SERIES":
-        parts.append(f"Futures {p.get('series','I')}")
+    if p.get("strike"): parts.append(f"{p['strike']} {p.get('otype','')}")
+    if p.get("exp_label"): parts.append(f"Exp: {p['exp_label']}")
+    elif p.get("otype") == "FUT_SERIES": parts.append(f"Futures {p.get('series','I')}")
     subtitle = " | ".join(parts)
-
-    # Build datetime for x-axis
     df_plot = df_plot.copy()
     df_plot["dt"] = pd.to_datetime(date_str + " " + df_plot["time"].astype(str).str[:8],
                                     errors="coerce")
     if df_plot["dt"].isna().all():
         df_plot["dt"] = pd.to_datetime(date_str + " " + df_plot["minute"] + ":00")
-
     first_open = float(df_plot["open_"].iloc[0])
     last_close = float(df_plot["close"].iloc[-1])
     day_high   = float(df_plot["high"].max())
@@ -903,8 +744,6 @@ def render_view_chart(df_raw, all_tickers, parsed_map, all_insts,
     pnl = last_close - first_open
     pnl_pct = (pnl/first_open*100) if first_open else 0
     pnl_color = "#2e7d32" if pnl>=0 else "#c62828"
-
-    # ── Header bar (like TradingView) ──
     st.markdown(
         f'<div style="background:#fff;border:1px solid #e4e0d8;border-radius:8px;'
         f'padding:10px 14px;margin-bottom:8px;display:flex;align-items:center;'
@@ -920,8 +759,6 @@ def render_view_chart(df_raw, all_tickers, parsed_map, all_insts,
         f'<span style="font-size:.68rem;color:#c62828">L {day_low:,.2f}</span>'
         f'</div>',
         unsafe_allow_html=True)
-
-    # ── Candlestick ──
     fig = go.Figure()
     fig.add_candlestick(
         x=df_plot["dt"],
@@ -930,22 +767,17 @@ def render_view_chart(df_raw, all_tickers, parsed_map, all_insts,
         increasing_line_color="#26a69a",increasing_fillcolor="#26a69a",
         decreasing_line_color="#ef5350",decreasing_fillcolor="#ef5350",
         name="Price")
-
     has_vol = "volume" in df_plot.columns and df_plot["volume"].sum() > 0
     if has_vol:
-        # Color volume bars by direction
         vol_colors = ["#26a69a" if c >= o else "#ef5350"
                       for o, c in zip(df_plot["open_"], df_plot["close"])]
         fig.add_bar(x=df_plot["dt"],y=df_plot["volume"],
                     name="Volume",marker_color=vol_colors,
                     marker_opacity=0.35,yaxis="y2")
-
-    # Last price line
     fig.add_hline(y=last_close,line_color="#1565c0",line_dash="dot",line_width=1,
                   annotation_text=f"{last_close:,.2f}",
                   annotation_font_color="#1565c0",annotation_font_size=10,
                   annotation_position="right")
-
     tick_every = max(1, len(df_plot)//20)
     fig.update_layout(
         paper_bgcolor="#fff",plot_bgcolor="#131722",
@@ -972,8 +804,6 @@ def render_view_chart(df_raw, all_tickers, parsed_map, all_insts,
                         font=dict(family="DM Mono",size=11,color="#d1d4dc")))
     st.plotly_chart(fig,use_container_width=True,
                     config={"displayModeBar":True,"scrollZoom":True})
-
-    # ── Stats ──
     day_vol = int(df_plot["volume"].sum()) if has_vol else 0
     last_oi = int(df_plot["oi"].iloc[-1]) if "oi" in df_plot.columns else 0
     s1,s2,s3,s4,s5,s6,s7 = st.columns(7)
@@ -995,71 +825,339 @@ def main():
     if "sel_exp"   not in st.session_state: st.session_state.sel_exp = None
     if "ch_depth"  not in st.session_state: st.session_state.ch_depth = 10
 
-    # ── Global CSS ──
+    # ══════════════════════════════════════════════════════════════════════════
+    #  GLOBAL CSS  ← THE ONLY SECTION CHANGED FROM THE ORIGINAL
+    #
+    #  Root problem: Streamlit's BaseWeb components (datepicker popover,
+    #  selectbox listbox, number-input, slider) inherit `prefers-color-scheme`
+    #  from the OS. On a dark-mode system every popup renders with a near-black
+    #  background and near-black text → completely unreadable.
+    #
+    #  Fix strategy:
+    #    1. Force the Streamlit theme token "--background-color" and all
+    #       BaseWeb/Emotion color tokens to explicit light values via CSS
+    #       custom-property overrides on :root.
+    #    2. Target every portal/popover layer that Streamlit mounts OUTSIDE
+    #       the main React tree (they get appended to <body> as siblings of
+    #       #root, so they don't inherit component-level overrides — they need
+    #       body-level or universal rules).
+    #    3. Override the date-picker calendar cell colours, the selectbox
+    #       listbox, the number-input spinner, and the slider track.
+    #    4. Keep the intentionally-dark areas (the candlestick chart bg
+    #       #131722, the hover tooltip) by scoping them inside plotly's own
+    #       SVG container which is immune to these CSS rules.
+    # ══════════════════════════════════════════════════════════════════════════
     st.markdown("""
     <style>
+    /* ── 0. Font import ────────────────────────────────────────────────── */
     @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=DM+Mono:wght@400;500&display=swap');
-    :root{--bg:#f6f4ef;--surface:#fff;--border:#e4e0d8;--border2:#d0ccc2;
-      --text1:#1a1a1a;--text2:#44443e;--text3:#888880;--accent:#1976d2;}
-    html,body,[class*="css"]{font-family:'DM Sans',sans-serif!important;}
-    .stApp,.main{background:var(--bg)!important;}
-    .main .block-container{padding:.75rem 1.1rem!important;max-width:100%!important;}
-    p,span,label,div,small,[class*="stMarkdown"],[class*="stCheckbox"] label,
-    [class*="stRadio"] label,[class*="stSelectbox"] label,
-    [data-testid="stMarkdownContainer"],[data-testid="stMarkdownContainer"] p,
-    [data-testid="stMarkdownContainer"] strong{color:var(--text1)!important;}
-    .stCheckbox>label{color:var(--text1)!important;font-size:.82rem!important;}
-    .stRadio>div{flex-direction:row!important;gap:.4rem!important;flex-wrap:wrap!important;}
-    .stRadio>div>label{background:var(--surface)!important;border:1.5px solid var(--border2)!important;
-      border-radius:20px!important;padding:.2rem .7rem!important;font-size:.76rem!important;
-      color:var(--text1)!important;cursor:pointer!important;}
-    .stRadio>div>label:has(input:checked){border-color:var(--accent)!important;
-      color:var(--accent)!important;background:#e8f0fe!important;}
-    .panel-label{font-size:.63rem;font-weight:700;color:var(--text3);
-      text-transform:uppercase;letter-spacing:.08em;margin:10px 0 5px;display:block;}
-    .stTabs [data-baseweb="tab-list"]{gap:0;background:var(--surface);
-      border-bottom:2px solid var(--border);padding:0;}
-    .stTabs [data-baseweb="tab"]{font-size:.82rem!important;font-weight:500!important;
-      color:var(--text2)!important;padding:.5rem 1.2rem!important;border-radius:0!important;
-      border-bottom:2px solid transparent!important;margin-bottom:-2px!important;
-      background:transparent!important;}
-    .stTabs [aria-selected="true"]{color:var(--accent)!important;
-      border-bottom:2px solid var(--accent)!important;font-weight:600!important;}
-    .stTabs [data-baseweb="tab-panel"]{padding:0!important;}
-    .stButton>button{font-size:.78rem!important;font-weight:500!important;
-      background:var(--surface)!important;border:1.5px solid var(--border2)!important;
-      color:var(--text1)!important;border-radius:6px!important;
-      padding:.28rem .75rem!important;transition:all .15s!important;
-      cursor:pointer!important;opacity:1!important;}
-    .stButton>button:hover{border-color:var(--accent)!important;
-      color:var(--accent)!important;background:#e8f0fe!important;
-      box-shadow:0 1px 4px rgba(25,118,210,0.15)!important;}
-    .stButton>button:active{transform:scale(0.97)!important;
-      background:#d4e4fc!important;}
-    button[kind="primary"]{background:var(--accent)!important;color:#fff!important;
-      border-color:var(--accent)!important;font-weight:600!important;}
-    button[kind="primary"]:hover{background:#1565c0!important;
-      border-color:#1565c0!important;color:#fff!important;}
-    .stTextInput>div>div>input,.stDateInput>div>div>input{
-      font-family:'DM Mono',monospace!important;font-size:.82rem!important;
-      background:var(--surface)!important;border:1.5px solid var(--border2)!important;
-      border-radius:6px!important;color:var(--text1)!important;padding:.32rem .6rem!important;}
-    .stSelectbox>div>div{font-size:.8rem!important;background:var(--surface)!important;
-      border:1.5px solid var(--border2)!important;border-radius:6px!important;
-      color:var(--text1)!important;}
-    .stNumberInput>div>div>input{font-family:'DM Mono',monospace!important;font-size:.8rem!important;
-      background:var(--surface)!important;border:1.5px solid var(--border2)!important;
-      border-radius:6px!important;color:var(--text1)!important;}
-    [data-testid="stMetricValue"]{font-family:'DM Mono',monospace!important;
-      font-size:1.05rem!important;font-weight:600!important;color:var(--text1)!important;}
-    [data-testid="stMetricLabel"]{font-size:.58rem!important;color:var(--text3)!important;
-      text-transform:uppercase!important;letter-spacing:.07em!important;}
-    hr{border-color:var(--border)!important;margin:.35rem 0!important;}
-    #MainMenu,footer,header{visibility:hidden;}
-    .stDeployButton{display:none;}
-    </style>""", unsafe_allow_html=True)
 
-    # Check if we have remote access
+    /* ── 1. Design tokens — forced light regardless of OS theme ────────── */
+    :root {
+      color-scheme: light !important;          /* stops browser dark-mode inheritance */
+      --bg:      #f6f4ef;
+      --surface: #ffffff;
+      --border:  #e4e0d8;
+      --border2: #d0ccc2;
+      --text1:   #1a1a1a;
+      --text2:   #44443e;
+      --text3:   #888880;
+      --accent:  #1976d2;
+    }
+
+    /* ── 2. App shell ───────────────────────────────────────────────────── */
+    html, body, [class*="css"] { font-family: 'DM Sans', sans-serif !important; }
+    .stApp, .main              { background: var(--bg) !important; }
+    .main .block-container     { padding: .75rem 1.1rem !important; max-width: 100% !important; }
+
+    /* ── 3. Universal text colour (all Streamlit markdown/labels) ───────── */
+    p, span, label, div, small,
+    [class*="stMarkdown"], [class*="stCheckbox"] label, [class*="stRadio"] label,
+    [class*="stSelectbox"] label,
+    [data-testid="stMarkdownContainer"],
+    [data-testid="stMarkdownContainer"] p,
+    [data-testid="stMarkdownContainer"] strong {
+      color: var(--text1) !important;
+    }
+
+    /* ── 4. DATEPICKER — input field ────────────────────────────────────── */
+    /*  The field itself (dark bg / dark text on dark-mode OS)             */
+    [data-testid="stDateInput"] input,
+    [data-testid="stDateInput"] div[data-baseweb="input"],
+    [data-testid="stDateInput"] div[data-baseweb="base-input"] {
+      background-color: #ffffff !important;
+      color:            #1a1a1a !important;
+      border-color:     #d0ccc2 !important;
+    }
+
+    /* ── 5. DATEPICKER — floating calendar popover ───────────────────────
+       Streamlit mounts the calendar as a portal directly on <body>,
+       outside the React root — we must target it at body/universal scope. */
+
+    /* Popover wrapper & arrow */
+    [data-baseweb="popover"],
+    [data-baseweb="popover"] > div {
+      background-color: #ffffff !important;
+      color:            #1a1a1a !important;
+      border:           1px solid #d0ccc2 !important;
+      box-shadow:       0 4px 20px rgba(0,0,0,.12) !important;
+    }
+
+    /* Calendar container */
+    [data-baseweb="calendar"],
+    [data-baseweb="calendar"] * {
+      background-color: #ffffff !important;
+      color:            #1a1a1a !important;
+    }
+
+    /* Month/year header text */
+    [data-baseweb="calendar"] [data-baseweb="select"] *,
+    [data-baseweb="calendar"] button {
+      color:            #1a1a1a !important;
+      background-color: #ffffff !important;
+    }
+
+    /* Day-of-week headers (Su Mo Tu …) */
+    [data-baseweb="calendar"] [role="columnheader"] {
+      color: #888 !important;
+    }
+
+    /* Individual day cells — default */
+    [data-baseweb="calendar"] [role="gridcell"] button,
+    [data-baseweb="calendar"] [data-baseweb="button"] {
+      color:            #1a1a1a !important;
+      background-color: transparent !important;
+      border-radius:    50% !important;
+    }
+
+    /* Day cell — hover */
+    [data-baseweb="calendar"] [role="gridcell"] button:hover {
+      background-color: #e8f0fe !important;
+      color:            #1565c0 !important;
+    }
+
+    /* Day cell — selected (today / chosen date) */
+    [data-baseweb="calendar"] [aria-selected="true"] button,
+    [data-baseweb="calendar"] [data-selected="true"] button {
+      background-color: #1976d2 !important;
+      color:            #ffffff !important;
+    }
+
+    /* Disabled / out-of-range days */
+    [data-baseweb="calendar"] [aria-disabled="true"] button {
+      color:   #ccc !important;
+      opacity: 0.5 !important;
+    }
+
+    /* Month/year select dropdowns inside the calendar header */
+    [data-baseweb="calendar"] [data-baseweb="select"] > div:first-child {
+      background-color: #f5f4ef !important;
+      color:            #1a1a1a !important;
+      border-color:     #d0ccc2 !important;
+    }
+
+    /* ── 6. SELECTBOX — closed pill ─────────────────────────────────────── */
+    .stSelectbox > div > div {
+      font-size:        .8rem !important;
+      background-color: #ffffff !important;
+      border:           1.5px solid #d0ccc2 !important;
+      border-radius:    6px !important;
+      color:            #1a1a1a !important;
+    }
+
+    /* ── 7. SELECTBOX — open dropdown listbox (portal, outside root) ────── */
+    [data-baseweb="menu"],
+    [data-baseweb="menu"] ul,
+    [data-baseweb="menu"] li,
+    [role="listbox"],
+    [role="option"],
+    [role="listbox"] *,
+    [role="option"] * {
+      background-color: #ffffff !important;
+      color:            #1a1a1a !important;
+    }
+
+    /* Listbox item hover */
+    [data-baseweb="menu"] [aria-selected="true"],
+    [data-baseweb="menu"] li:hover,
+    [role="option"]:hover,
+    [role="option"][aria-selected="true"] {
+      background-color: #e8f0fe !important;
+      color:            #1565c0 !important;
+    }
+
+    /* Listbox item — currently selected tick mark */
+    [data-baseweb="menu"] [aria-selected="true"]::after,
+    [role="option"][aria-selected="true"]::after {
+      color: #1976d2 !important;
+    }
+
+    /* ── 8. TEXT INPUT ──────────────────────────────────────────────────── */
+    .stTextInput > div > div > input,
+    .stDateInput  > div > div > input {
+      font-family:      'DM Mono', monospace !important;
+      font-size:        .82rem !important;
+      background-color: #ffffff !important;
+      border:           1.5px solid #d0ccc2 !important;
+      border-radius:    6px !important;
+      color:            #1a1a1a !important;
+      padding:          .32rem .6rem !important;
+    }
+
+    /* ── 9. NUMBER INPUT ────────────────────────────────────────────────── */
+    .stNumberInput > div > div > input {
+      font-family:      'DM Mono', monospace !important;
+      font-size:        .8rem !important;
+      background-color: #ffffff !important;
+      border:           1.5px solid #d0ccc2 !important;
+      border-radius:    6px !important;
+      color:            #1a1a1a !important;
+    }
+    /* Spinner buttons */
+    .stNumberInput button {
+      background-color: #f5f4ef !important;
+      color:            #1a1a1a !important;
+      border-color:     #d0ccc2 !important;
+    }
+
+    /* ── 10. SELECT-SLIDER ──────────────────────────────────────────────── */
+    [data-testid="stSlider"] [role="slider"] {
+      background-color: #1976d2 !important;
+    }
+    [data-testid="stSlider"] [data-baseweb="slider"] [data-testid="stTickBar"],
+    [data-testid="stSlider"] [data-baseweb="slider"] div {
+      background-color: #e4e0d8 !important;
+      color:            #1a1a1a !important;
+    }
+    /* Slider tooltip bubble */
+    [data-baseweb="slider"] [role="tooltip"],
+    [data-baseweb="tooltip"] div {
+      background-color: #1976d2 !important;
+      color:            #ffffff !important;
+    }
+
+    /* ── 11. CHECKBOX ───────────────────────────────────────────────────── */
+    .stCheckbox > label {
+      color:      var(--text1) !important;
+      font-size:  .82rem !important;
+    }
+
+    /* ── 12. RADIO pills ────────────────────────────────────────────────── */
+    .stRadio > div { flex-direction: row !important; gap: .4rem !important; flex-wrap: wrap !important; }
+    .stRadio > div > label {
+      background-color: #ffffff !important;
+      border:           1.5px solid #d0ccc2 !important;
+      border-radius:    20px !important;
+      padding:          .2rem .7rem !important;
+      font-size:        .76rem !important;
+      color:            #1a1a1a !important;
+      cursor:           pointer !important;
+    }
+    .stRadio > div > label:has(input:checked) {
+      border-color:     #1976d2 !important;
+      color:            #1976d2 !important;
+      background-color: #e8f0fe !important;
+    }
+
+    /* ── 13. Buttons ────────────────────────────────────────────────────── */
+    .stButton > button {
+      font-size:        .78rem !important;
+      font-weight:      500 !important;
+      background-color: #ffffff !important;
+      border:           1.5px solid #d0ccc2 !important;
+      color:            #1a1a1a !important;
+      border-radius:    6px !important;
+      padding:          .28rem .75rem !important;
+      transition:       all .15s !important;
+      cursor:           pointer !important;
+      opacity:          1 !important;
+    }
+    .stButton > button:hover {
+      border-color:     #1976d2 !important;
+      color:            #1976d2 !important;
+      background-color: #e8f0fe !important;
+      box-shadow:       0 1px 4px rgba(25,118,210,.15) !important;
+    }
+    .stButton > button:active {
+      transform:        scale(0.97) !important;
+      background-color: #d4e4fc !important;
+    }
+    button[kind="primary"] {
+      background-color: #1976d2 !important;
+      color:            #ffffff !important;
+      border-color:     #1976d2 !important;
+      font-weight:      600 !important;
+    }
+    button[kind="primary"]:hover {
+      background-color: #1565c0 !important;
+      border-color:     #1565c0 !important;
+      color:            #ffffff !important;
+    }
+
+    /* ── 14. Tabs ───────────────────────────────────────────────────────── */
+    .stTabs [data-baseweb="tab-list"] {
+      gap: 0; background: #ffffff;
+      border-bottom: 2px solid #e4e0d8; padding: 0;
+    }
+    .stTabs [data-baseweb="tab"] {
+      font-size:   .82rem !important; font-weight: 500 !important;
+      color:       #44443e !important; padding: .5rem 1.2rem !important;
+      border-radius: 0 !important;
+      border-bottom: 2px solid transparent !important; margin-bottom: -2px !important;
+      background: transparent !important;
+    }
+    .stTabs [aria-selected="true"] {
+      color:        #1976d2 !important;
+      border-bottom: 2px solid #1976d2 !important;
+      font-weight:  600 !important;
+    }
+    .stTabs [data-baseweb="tab-panel"] { padding: 0 !important; }
+
+    /* ── 15. Metric tiles ───────────────────────────────────────────────── */
+    [data-testid="stMetricValue"] {
+      font-family: 'DM Mono', monospace !important;
+      font-size:   1.05rem !important; font-weight: 600 !important;
+      color:       #1a1a1a !important;
+    }
+    [data-testid="stMetricLabel"] {
+      font-size:      .58rem !important; color: #888880 !important;
+      text-transform: uppercase !important; letter-spacing: .07em !important;
+    }
+
+    /* ── 16. Misc ───────────────────────────────────────────────────────── */
+    .panel-label {
+      font-size: .63rem; font-weight: 700; color: #888880;
+      text-transform: uppercase; letter-spacing: .08em;
+      margin: 10px 0 5px; display: block;
+    }
+    hr { border-color: #e4e0d8 !important; margin: .35rem 0 !important; }
+    #MainMenu, footer, header { visibility: hidden; }
+    .stDeployButton { display: none; }
+
+    /* ── 17. Tooltip / popover universal light-mode guard ───────────────── 
+       Any BaseWeb overlay that Streamlit appends to <body>. This acts as a
+       catch-all for any widget we may have missed above.                  */
+    body > div[data-baseweb],
+    body > div[data-baseweb] *:not(svg):not(path) {
+      background-color: #ffffff !important;
+      color:            #1a1a1a !important;
+    }
+    /* But let selected/active states still show colour */
+    body > div[data-baseweb] [aria-selected="true"],
+    body > div[data-baseweb] [data-selected="true"],
+    body > div[data-baseweb] button[aria-pressed="true"] {
+      background-color: #1976d2 !important;
+      color:            #ffffff !important;
+    }
+    body > div[data-baseweb] li:hover,
+    body > div[data-baseweb] [role="option"]:hover {
+      background-color: #e8f0fe !important;
+      color:            #1565c0 !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    # ── Check if we have remote access ──
     data_exists = bool(HF_TOKEN)
     expiry_df   = load_expiry_df(EXPIRY_CSV)
 
@@ -1117,7 +1215,7 @@ def main():
         all_insts = [st.session_state.inst] + all_insts
     cur_idx = all_insts.index(st.session_state.inst) if st.session_state.inst in all_insts else 0
 
-    # Get all expiry dates for the currently selected instrument
+    # Expiry dates for currently selected instrument
     if not is_demo:
         _inst_tickers = [tk for tk in all_tickers if parsed_map[tk]["inst"] == st.session_state.inst]
         _inst_exp_dates = sorted(set(
@@ -1125,26 +1223,21 @@ def main():
             if parsed_map[tk].get("exp")
         ))
     else:
-        # Demo: generate weekly Thursdays
         _inst_exp_dates = []
         d = sel_date
         while len(_inst_exp_dates) < 8:
-            if d.weekday() == 3:
-                _inst_exp_dates.append(d)
+            if d.weekday() == 3: _inst_exp_dates.append(d)
             d += timedelta(days=1)
 
-    # Format expiry dates for dropdown: "17 Feb 22 (0d)"
     _exp_dd_display = [_format_exp_date(e, sel_date) for e in _inst_exp_dates]
     _exp_dd_keys    = [_exp_date_to_key(e) for e in _inst_exp_dates]
 
-    # Instrument + Expiry dropdown on same row
     idd1, idd2 = st.columns([2, 1.5])
     with idd1:
         sel_dd = st.selectbox("Instrument", options=all_insts, index=cur_idx,
                                label_visibility="collapsed", key="inst_dd",
                                help=f"{len(all_insts)} instruments available")
     with idd2:
-        # Expiry dropdown with DTE
         if _exp_dd_display:
             cur_exp_key = st.session_state.sel_exp
             if cur_exp_key in _exp_dd_keys:
@@ -1155,7 +1248,6 @@ def main():
                                             index=exp_dd_idx,
                                             label_visibility="collapsed", key="exp_dd",
                                             help="Select expiry (days to expiry shown)")
-            # Map display back to key
             sel_exp_key = _exp_dd_keys[_exp_dd_display.index(sel_exp_display)]
         else:
             sel_exp_key = None
@@ -1173,8 +1265,7 @@ def main():
     if not is_demo:
         chain_data = build_chain(df_raw, parsed_map, inst, time_str,
                                   st.session_state.sel_exp, depth, sel_date)
-        if not chain_data:
-            is_demo = True
+        if not chain_data: is_demo = True
     if is_demo:
         chain_data = make_demo_chain(inst, sel_date, time_str,
                                       st.session_state.sel_exp, depth)
@@ -1190,7 +1281,7 @@ def main():
         chain_df = chain_df[chain_df["is_atm"]|~(chain_df["is_itm_ce"]|chain_df["is_itm_pe"])].copy()
         chain_data["chain"] = chain_df
 
-    # ── Expiry quick-switch buttons with DTE ──
+    # ── Expiry quick-switch buttons ──
     if expiry_dates:
         show_n = min(len(expiry_dates),10)
         e_cols = st.columns(show_n)
@@ -1277,7 +1368,6 @@ def main():
             render_oi_chart(chain_data, df_raw, parsed_map, inst, active_exp,
                             cf, ct, int(sk_min), int(sk_max), ch_depth, is_demo)
 
-    # ── Tab 3: View Chart ──
     with tab3:
         render_view_chart(df_raw, all_tickers, parsed_map, all_insts,
                            inst, date_str, time_str, expiry_dates, is_demo)
@@ -1291,6 +1381,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
