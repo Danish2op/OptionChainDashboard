@@ -1239,6 +1239,11 @@ def main():
                                help=f"{len(all_insts)} instruments available")
     with idd2:
         if _exp_dd_display:
+            # ── Sync dropdown from pending button click (BEFORE widget renders) ──
+            _pending = st.session_state.pop("_pending_exp_display", None)
+            if _pending and _pending in _exp_dd_display:
+                st.session_state.exp_dd = _pending
+
             cur_exp_key = st.session_state.sel_exp
             if cur_exp_key in _exp_dd_keys:
                 exp_dd_idx = _exp_dd_keys.index(cur_exp_key)
@@ -1293,6 +1298,9 @@ def main():
                 if st.button(btn_lbl,key=f"exp_{i}",use_container_width=True,
                               type="primary" if is_sel else "secondary"):
                     st.session_state.sel_exp = _exp_date_to_key(ed)
+                    # Store pending display value — will be applied
+                    # BEFORE the selectbox renders on the next rerun
+                    st.session_state["_pending_exp_display"] = _format_exp_date(ed, sel_date)
                     st.rerun()
 
     # ── Stats bar ──
